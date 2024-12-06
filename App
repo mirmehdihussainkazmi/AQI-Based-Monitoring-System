@@ -1,0 +1,257 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <FS.h>  // Include SPIFFS for file system support
+
+// Replace with your network credentials
+const char* ssid = "Ufone-LTE-F8584";       
+const char* password = "7A5F8584";          
+
+ESP8266WebServer server(80);
+
+const char* adminUsername = "admin";         // Admin username
+const char* adminPassword = "password123";   // Admin password
+
+// Pin Definitions
+const int MUX_S0 = D5;  // Multiplexer select 
+const int MUX_S1 = D6;  // Multiplexer select 
+const int MUX_S2 = D7;  // Multiplexer select 
+const int LED_PIN = D8; // LED for the dust sensor
+
+// Sensor Indexes
+const int SENSOR_DUST = 0;  // Dust sensor connected to CD4051 
+const int SENSOR_CO = 1;    // MQ2 for CO connected to CD4051 
+const int SENSOR_SOX = 2;   // MQ2 for SOx connected to CD4051 
+
+// Function declarations
+float readSensor(int sensorIndex);
+void selectMuxPin(int sensorIndex);
+void saveSensorData(float dustValue, float coValue, float soxValue);
+String loadAllSensorData();
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize SPIFFS
+  if (!SPIFFS.begin()) {
+    Serial.println("SPIFFS Mount Failed");
+    return;
+  }
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
+  }
+
+  Serial.println("\nConnected to Wi-Fi");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Setup multiplexer control pins
+  pinMode(MUX_S0, OUTPUT);
+  pinMode(MUX_S1, OUTPUT);
+  pinMode(MUX_S2, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+
+  // Serve login page
+  server.on("/", HTTP_GET, []() {
+    String html = R"rawliteral(
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Login Page</title>
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background: linear-gradient(to right, #4facfe, #00f2fe);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: #fff;
+          }
+          .container {
+            text-align: center;
+            background: rgba(255, 255, 255, 0.2);
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2);
+          }
+          img {
+            width: 200px;
+            height: auto;
+            margin-bottom: 20px;
+          }
+          input[type="text"], input[type="password"] {
+            padding: 10px;
+            margin: 10px 0;
+            width: 90%;
+            border: none;
+            border-radius: 5px;
+          }
+          input[type="submit"] {
+            padding: 10px;
+            margin-top: 10px;
+            width: 95%;
+            background: #4facfe;
+            border: none;
+            color: #fff;
+            font-weight: bold;
+            border-radius: 5px;
+            cursor: pointer;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <img src="https://i.postimg.cc/G9mb4rjC/logo.png" alt="Logo">
+          <h1>Welcome to the Server</h1>
+          <form action="/login" method="POST">
+            <input type="text" name="username" placeholder="Username"><br>
+            <input type="password" name="password" placeholder="Password"><br>
+            <input type="submit" value="Login">
+          </form>
+        </div>
+      </body>
+      </html>
+    )rawliteral";
+
+    server.send(200, "text/html", html);
+  });
+
+  // Handle login validation
+  server.on("/login", HTTP_POST, []() {
+    if (!server.hasArg("username") || !server.hasArg("password")) {
+      server.send(400, "text/plain", "Invalid Request");
+      return;
+    }
+
+    String username = server.arg("username");
+    String password = server.arg("password");
+
+    if (username == adminUsername && password == adminPassword) {
+      server.sendHeader("Location", "/sensors");
+      server.send(302, "text/plain", "Redirecting...");
+    } else {
+      server.send(200, "text/html", "<html><body><h1>Login Failed</h1><a href='/'>Go back to Login</a></body></html>");
+    }
+  });
+
+  // Serve sensor data page
+  server.on("/sensors", HTTP_GET, []() {
+    // Get sensor values
+    float dustValue = readSensor(SENSOR_DUST);
+    float coValue = readSensor(SENSOR_CO);
+    float soxValue = readSensor(SENSOR_SOX);
+
+    String html = "<!DOCTYPE html>";
+    html += "<html lang='en'>";
+    html += "<head>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+    html += "<title>Sensor Data</title>";
+    html += "<style>";
+    html += "body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f0f0f0; color: #333; }";
+    html += ".container { width: 90%; max-width: 800px; margin: 30px auto; background: #fff; padding: 20px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1); text-align: center; }";
+    html += "h1 { color: #4facfe; }";
+    html += ".logo { width: 150px; margin-bottom: 20px; }";
+    html += ".sensor-value { font-size: 24px; font-weight: bold; color: #333; margin: 20px 0; }";
+    html += ".sensor-title { font-size: 20px; color: #4facfe; margin: 10px 0; }";
+    html += ".btn { display: inline-block; padding: 10px 20px; background: #4facfe; color: #fff; text-decoration: none; border-radius: 5px; margin-top: 20px; font-weight: bold; }";
+    html += ".btn:hover { background: #00f2fe; }";
+    html += "</style>";
+    html += "</head>";
+    html += "<body>";
+    html += "<div class='container'>";
+    html += "<img src='https://i.postimg.cc/G9mb4rjC/logo.png' alt='Logo' class='logo'>";
+    html += "<h1>Sensor Data</h1>";
+
+    html += "<div class='sensor-title'>Dust Sensor Value:</div>";
+    html += "<div class='sensor-value'>" + String(dustValue) + " V</div>";
+
+    html += "<div class='sensor-title'>CO Sensor Value:</div>";
+    html += "<div class='sensor-value'>" + String(coValue) + " V</div>";
+
+    html += "<div class='sensor-title'>SOx Sensor Value:</div>";
+    html += "<div class='sensor-value'>" + String(soxValue) + " V</div>";
+
+    html += "<a href='/save' class='btn'>Save Data</a>";
+    html += "<a href='/data' class='btn'>View Saved Data</a>";
+    html += "<a href='/' class='btn'>Logout</a>";
+    html += "</div>";
+    html += "</body>";
+    html += "</html>";
+
+    server.send(200, "text/html", html);
+  });
+
+  // Save sensor data page
+  server.on("/save", HTTP_GET, []() {
+    float dustValue = readSensor(SENSOR_DUST);
+    float coValue = readSensor(SENSOR_CO);
+    float soxValue = readSensor(SENSOR_SOX);
+
+    saveSensorData(dustValue, coValue, soxValue); // Save data to file
+
+    String html = "<html><body><h1>Data Saved Successfully!</h1><a href='/sensors'>Go back to Sensor Data</a></body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  // View saved data page
+  server.on("/data", HTTP_GET, []() {
+    String allData = loadAllSensorData(); // Load all saved data
+
+    String html = "<html><body><h1>Saved Sensor Data</h1><pre>" + allData + "</pre><a href='/sensors'>Go back to Sensor Data</a></body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  // Start the server
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}
+
+float readSensor(int sensorIndex) {
+  selectMuxPin(sensorIndex); // Select the correct sensor
+  delay(10);                 // Wait for stable reading
+  int sensorValue = analogRead(A0); // Read from A0 (analog input)
+  float voltage = sensorValue * (3.3 / 1024.0); // Convert to voltage
+  return voltage;
+}
+
+void selectMuxPin(int sensorIndex) {
+  digitalWrite(MUX_S0, sensorIndex & 0x01);
+  digitalWrite(MUX_S1, (sensorIndex >> 1) & 0x01);
+  digitalWrite(MUX_S2, (sensorIndex >> 2) & 0x01);
+}
+
+void saveSensorData(float dustValue, float coValue, float soxValue) {
+  File file = SPIFFS.open("/sensor_data.txt", "a");
+  if (!file) {
+    Serial.println("Failed to open file for writing");
+    return;
+  }
+  file.print("Dust Value: "); file.println(dustValue);
+  file.print("CO Value: "); file.println(coValue);
+  file.print("SOx Value: "); file.println(soxValue);
+  file.println("----------");
+  file.close();
+}
+
+String loadAllSensorData() {
+  File file = SPIFFS.open("/sensor_data.txt", "r");
+  String data = "";
+  if (!file) {
+    return "No data found.";
+  }
+  while (file.available()) {
+    data += file.readString();
+  }
+  file.close();
+  return data;
+}
